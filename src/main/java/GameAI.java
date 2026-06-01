@@ -1,107 +1,136 @@
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 
 public class GameAI {
-    private final ObjectMapper mapper = new ObjectMapper();
-    private final List<String> hand = new ArrayList<>();
 
-    // 固定参数顺序：客户端对象、消息字符串、房间ID、座位号
-    public void handleMessage(TestClient client, String msg, int roomId, int seat) {
+    private static final ObjectMapper mapper = new ObjectMapper();
+
+    public void handleMessage(TestClient client, String msg, int roomId, int seat, MainFrame frame) {
         try {
             JsonNode root = mapper.readTree(msg);
-            if (root == null || !root.has("type")) return;
 
-            String type = root.get("type").asText();
+            String type = root.path("type").asText("");
 
-            // ================= 1. 处理通知类消息 (notify) =================
             if ("notify".equals(type)) {
-                if (!root.has("stage")) return;
-                String stage = root.get("stage").asText();
-
-                // 开局发牌
-                if ("beginning".equals(stage) && root.has("handCards")) {
-                    hand.clear();
-                    for (JsonNode c : root.get("handCards")) {
-                        hand.add(c.asText());
-                    }
-                    System.out.println("===== 游戏正式开始，座位 " + seat + " 手牌：" + hand + " =====");
-                }
+                frame.appendLog("【对局广播】" + root);
                 return;
             }
 
-            // ================= 2. 处理决策类消息 (act) =================
-            if ("act".equals(type)) {
-                if (!root.has("actionList") || !root.has("stage")) return;
+            if (!"act".equals(type)) return;
 
-                String stage = root.get("stage").asText();
-                JsonNode actionList = root.get("actionList");
+            String stage = root.path("stage").asText("");
+            JsonNode actionList = root.path("actionList");
 
-                if (actionList == null || actionList.isEmpty()) {
-                    System.out.printf("[警告] 座位 %d 收到 act 消息，但 actionList 为空。%n", seat);
-                    return;
-                }
+            if (actionList == null || !actionList.isArray() || actionList.size() == 0) return;
 
-                // --- 基础策略：挑选最佳动作 ---
-                JsonNode bestAct = null;
-                for (JsonNode act : actionList) {
-                    String actionType = act.get(0).asText();
-                    // 积极出牌，优先选择非“不要(PASS)”的动作
-                    if (!"PASS".equalsIgnoreCase(actionType)) {
-                        bestAct = act;
-                        break;
-                    }
-                }
-                if (bestAct == null) {
-                    bestAct = actionList.get(0);
-                }
+            int myPos = root.path("myPos").asInt(0);
 
-                // --- 根据官方文档规范，严格分支组装响应报文 ---
-                String responseJson = "";
+            // =========================
+            // ⭐ 核心：策略选择
+            // =========================
+            JsonNode best = chooseBestAction(actionList, root, stage);
 
-                if ("play".equals(stage)) {
-                    // 3.3 正常打牌请求
-                    responseJson = String.format(
-                            "{\"type\":\"PLAY\",\"data\":{\"roomId\":%d,\"player\":%d,\"act\":%s}}",
-                            roomId, seat, bestAct.toString()
-                    );
-                }
-                else if ("tribute".equals(stage)) {
-                    // 3.4 进贡请求
-                    responseJson = String.format(
+            String actStr = best.toString();
+
+            String sendJson;
+
+            switch (stage) {
+
+                case "tribute":
+                    sendJson = String.format(
                             "{\"type\":\"TRIBUTE\",\"data\":{\"roomId\":%d,\"player\":%d,\"act\":%s}}",
-                            roomId, seat, bestAct.toString()
+                            roomId, myPos, actStr
                     );
-                }
-                else if ("back".equals(stage)) {
-                    // 3.5 还牌请求 (PAYTRIBUTE) - 需要透传 tributePos 和 tribute
-                    int tributePos = root.get("tributePos").asInt();
-                    String tributeCard = root.get("tribute").asText();
+                    break;
 
-                    responseJson = String.format(
-                            "{\"type\":\"PAYTRIBUTE\",\"data\":{\"roomId\":%d,\"player\":%d,\"tributePos\":%d,\"tribute\":\"%s\",\"act\":%s}}",
-                            roomId, seat, tributePos, tributeCard, bestAct.toString()
+                case "back":
+                    sendJson = String.format(
+                            "{\"type\":\"PAYTRIBUTE\",\"data\":{\"roomId\":%d,\"player\":%d,\"act\":%s}}",
+                            roomId, myPos, actStr
                     );
-                }
-                else {
-                    // 兜底逻辑：如果有未知的 act 阶段，尝试转大写提交，防患于未然
-                    responseJson = String.format(
-                            "{\"type\":\"%s\",\"data\":{\"roomId\":%d,\"player\":%d,\"act\":%s}}",
-                            stage.toUpperCase(), roomId, seat, bestAct.toString()
+                    break;
+
+                default:
+                    sendJson = String.format(
+                            "{\"type\":\"PLAY\",\"data\":{\"roomId\":%d,\"player\":%d,\"act\":%s}}",
+                            roomId, myPos, actStr
                     );
-                }
-
-                System.out.printf("[AI 决策成功] 座位 %d 在 [%s] 阶段做出动作: %s%n", seat, stage, responseJson);
-
-                // 发送给服务器
-                client.send(responseJson);
             }
 
+            client.sendMsg(sendJson);
+
         } catch (Exception e) {
-            System.err.println("AI 处理消息时发生异常: " + e.getMessage());
+            frame.appendLog("AI 处理异常");
             e.printStackTrace();
         }
+    }
+
+    /**
+     * ⭐ 核心策略函数
+     */
+    private JsonNode chooseBestAction(JsonNode actionList, JsonNode root, String stage) {
+
+        List<JsonNode> passList = new ArrayList<>();
+        List<JsonNode> bombList = new ArrayList<>();
+        List<JsonNode> singleList = new ArrayList<>();
+        List<JsonNode> otherList = new ArrayList<>();
+
+        // 当前最大牌
+        JsonNode greaterAction = root.path("greaterAction");
+
+        for (JsonNode act : actionList) {
+
+            String type = act.get(0).asText("");
+
+            if ("PASS".equals(type)) {
+                passList.add(act);
+            } else if (type.contains("Bomb")) {
+                bombList.add(act);
+            } else if (type.contains("Single")) {
+                singleList.add(act);
+            } else {
+                otherList.add(act);
+            }
+        }
+
+        // =========================
+        // ⭐ 1. 进贡 / 还礼阶段
+        // =========================
+        if ("tribute".equals(stage) || "back".equals(stage)) {
+            // 优先最小牌（通常在列表前面更小）
+            return actionList.get(0);
+        }
+
+        // =========================
+        // ⭐ 2. PLAY阶段核心策略
+        // =========================
+
+        // ❗情况1：只能PASS
+        if (actionList.size() == 1 && passList.size() == 1) {
+            return passList.get(0);
+        }
+
+        // ❗情况2：有压制能力（优先非PASS）
+        for (JsonNode act : actionList) {
+            String type = act.get(0).asText("");
+
+            // 避免乱炸（除非快赢）
+            if (type.contains("Bomb") && actionList.size() > 3) continue;
+
+            // 优先小牌消耗（更容易赢）
+            if (!"PASS".equals(type) && !type.contains("Bomb")) {
+                return act;
+            }
+        }
+
+        // ❗情况3：必须PASS时避免乱送
+        if (!passList.isEmpty()) {
+            return passList.get(0);
+        }
+
+        // ❗兜底
+        return actionList.get(0);
     }
 }
