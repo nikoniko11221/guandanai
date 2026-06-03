@@ -1,97 +1,161 @@
 import com.fasterxml.jackson.databind.JsonNode;
-import com.fasterxml.jackson.databind.ObjectMapper;
 
-import java.util.*;
+import java.util.ArrayList;
+import java.util.List;
 
 public class GameAI {
-    private static final ObjectMapper mapper = new ObjectMapper();
 
-    public void handleMessage(TestClient client, String msg, int roomId, int seat, MainFrame frame) {
+    private int myPos = -1;
+
+    public void setMyPos(int pos) {
+        this.myPos = pos;
+    }
+
+    public void handle(TestClient client,
+                       JsonNode root,
+                       GameFrame frame,
+                       int myPos,
+                       int roomId) {
+
         try {
-            JsonNode root = mapper.readTree(msg);
-            String type = root.path("type").asText("");
-
-            if ("notify".equals(type)) {
-                frame.appendLog("【对局广播】" + root);
-                return;
-            }
-
-            if (!"act".equals(type)) return;
-
-            String stage = root.path("stage").asText("");
+            String stage = root.path("stage").asText();
             JsonNode actionList = root.path("actionList");
-            if (actionList == null || !actionList.isArray() || actionList.size() == 0) return;
 
-            int myPos = root.path("myPos").asInt(0);
-            JsonNode best = chooseBestAction(actionList, root, stage);
-            String actStr = best.toString();
-            String sendJson;
+            if (!actionList.isArray() || actionList.size() == 0) return;
+
+            int index = chooseIndex(actionList, stage);
+
+            JsonNode act = actionList.get(index);
+
+            String json;
 
             switch (stage) {
-                case "tribute":
-                    sendJson = String.format(
-                            "{\"type\":\"TRIBUTE\",\"data\":{\"roomId\":%d,\"player\":%d,\"act\":%s}}",
-                            roomId, myPos, actStr
-                    );
-                    break;
-                case "back":
-                    sendJson = String.format(
-                            "{\"type\":\"PAYTRIBUTE\",\"data\":{\"roomId\":%d,\"player\":%d,\"act\":%s}}",
-                            roomId, myPos, actStr
-                    );
-                    break;
-                default:
-                    sendJson = String.format(
-                            "{\"type\":\"PLAY\",\"data\":{\"roomId\":%d,\"player\":%d,\"act\":%s}}",
-                            roomId, myPos, actStr
-                    );
+
+                case "tribute" -> json = """
+                {
+                    "type":"TRIBUTE",
+                    "data":{
+                        "roomId":%d,
+                        "player":%d,
+                        "act":%s
+                    }
+                }
+                """.formatted(roomId, myPos, act);
+
+                case "back" -> {
+                    int triPos = root.path("tributePos").asInt();
+                    String triCard = root.path("tribute").asText();
+
+                    json = """
+                    {
+                        "type":"PAYTRIBUTE",
+                        "data":{
+                            "roomId":%d,
+                            "player":%d,
+                            "tributePos":%d,
+                            "tribute":"%s",
+                            "act":%s
+                        }
+                    }
+                    """.formatted(roomId, myPos, triPos, triCard, act);
+                }
+
+                default -> json = """
+                {
+                    "type":"PLAY",
+                    "data":{
+                        "roomId":%d,
+                        "player":%d,
+                        "act":%s
+                    }
+                }
+                """.formatted(roomId, myPos, act);
             }
-            client.sendMsg(sendJson);
+
+            client.sendMsg(json);
+
+            frame.log("AI[" + myPos + "] " + stage + " -> " + act);
+
         } catch (Exception e) {
-            frame.appendLog("AI 处理出牌异常");
-            e.printStackTrace();
+            frame.log("AI error:" + e.getMessage());
         }
     }
 
-    private JsonNode chooseBestAction(JsonNode actionList, JsonNode root, String stage) {
-        List<JsonNode> passList = new ArrayList<>();
-        List<JsonNode> bombList = new ArrayList<>();
-        List<JsonNode> singleList = new ArrayList<>();
-        List<JsonNode> otherList = new ArrayList<>();
-        JsonNode greaterAction = root.path("greaterAction");
+    // =========================
+    // 🎯 核心：选择策略（随机 + 稳定）
+    // =========================
+    private int chooseIndex(JsonNode actionList, String stage) {
 
-        for (JsonNode act : actionList) {
-            String type = act.get(0).asText("");
-            if ("PASS".equals(type)) {
-                passList.add(act);
-            } else if (type.contains("Bomb")) {
-                bombList.add(act);
-            } else if (type.contains("Single")) {
-                singleList.add(act);
-            } else {
-                otherList.add(act);
+        List<Integer> candidates = new ArrayList<>();
+        List<Integer> scores = new ArrayList<>();
+
+        int bestScore = Integer.MIN_VALUE;
+
+        // ① 计算所有动作分数
+        for (int i = 0; i < actionList.size(); i++) {
+            JsonNode act = actionList.get(i);
+            int s = score(act, stage);
+
+            scores.add(s);
+            bestScore = Math.max(bestScore, s);
+        }
+
+        // ② 保留“接近最优”的动作（人类行为核心）
+        int threshold = bestScore - 1200;
+
+        for (int i = 0; i < scores.size(); i++) {
+            if (scores.get(i) >= threshold) {
+                candidates.add(i);
             }
         }
 
-        if ("tribute".equals(stage) || "back".equals(stage)) {
-            return actionList.get(0);
-        }
-
-        if (actionList.size() == 1 && passList.size() == 1) {
-            return passList.get(0);
-        }
-
-        for (JsonNode act : actionList) {
-            String type = act.get(0).asText("");
-            if (type.contains("Bomb") && actionList.size() > 3) continue;
-            if (!"PASS".equals(type) && !type.contains("Bomb")) {
-                return act;
+        // ③ 防止极端情况（全PASS等）
+        if (candidates.isEmpty()) {
+            for (int i = 0; i < actionList.size(); i++) {
+                candidates.add(i);
             }
         }
 
-        if (!passList.isEmpty()) {
-            return passList.get(0);
+        // ④ 随机选一个（人类风格）
+        return candidates.get((int) (Math.random() * candidates.size()));
+    }
+
+    private int score(JsonNode act, String stage) {
+
+        String type = act.get(0).asText();
+
+        // ❌ PASS：低优先级但不是绝对禁止
+        if ("PASS".equals(type)) {
+            return -4000 + (int)(Math.random() * 500);
         }
-        return actionList.get(0);
+
+        int base = switch (type) {
+            case "Bomb" -> 5000;
+            case "StraightFlush" -> 4200;
+            case "Straight" -> 3200;
+            case "ThreeWithTwo" -> 2600;
+            case "TwoTrips" -> 2400;
+            case "ThreePair" -> 2200;
+            case "Trips" -> 2000;
+            case "Pair" -> 1200;
+            case "Single" -> 800;
+            default -> 500;
+        };
+
+        int size = act.get(2).size();
+
+        // 👉 人类行为：偶尔不打最大
+        int randomness = (int) (Math.random() * 400);
+
+        // 👉 控制节奏：避免一次出太多（防止滚雪球）
+        int balance = (size >= 5) ? -300 : 0;
+
+        // 👉 出牌奖励（但不极端）
+        int sizeBonus = size * 600;
+
+        // 👉 轻微惩罚炸弹（避免乱炸）
+        int bombPenalty = "Bomb".equals(type) ? -200 : 0;
+
+        return base + sizeBonus + randomness + balance + bombPenalty;
     }
 }
